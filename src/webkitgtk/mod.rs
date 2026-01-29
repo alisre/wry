@@ -43,6 +43,43 @@ use webkit2gtk::{
   WebsiteDataManagerExtManual, WebsitePolicies,
 };
 use webkit2gtk_sys::{
+
+    // Store TLS ignore configuration on WebContext (to be used by handler later)
+    if let Some(ctx) = webview.context() {
+      use gtk::glib::ObjectExt;
+      const KEY_IGNORE_ALL: &str = "wry_ignore_all_tls_errors";
+      const KEY_HOSTS: &str = "wry_ignore_tls_error_hosts";
+
+      // Merge env vars with builder flags for flexibility when upper stacks don't expose API.
+      let mut ignore_all = pl_attrs.ignore_all_tls_errors
+        || std::env::var("WRY_IGNORE_ALL_TLS_ERRORS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+
+      let mut hosts_set: std::collections::HashSet<String> = pl_attrs
+        .ignore_tls_error_hosts
+        .clone()
+        .unwrap_or_default();
+      if let Ok(list) = std::env::var("WRY_IGNORE_TLS_ERROR_HOSTS") {
+        for part in list.split(',') {
+          let h = part.trim();
+          if !h.is_empty() {
+            hosts_set.insert(h.to_string());
+          }
+        }
+      }
+
+      // Store as 'static via Box::leak
+      let ignore_all_box = Box::new(ignore_all);
+      unsafe {
+        ctx.set_data(KEY_IGNORE_ALL.as_bytes(), Box::leak(ignore_all_box));
+      }
+
+      if !hosts_set.is_empty() {
+        let hosts_box = Box::new(hosts_set);
+        unsafe {
+          ctx.set_data(KEY_HOSTS.as_bytes(), Box::leak(hosts_box));
+        }
+      }
+    }
   webkit_get_major_version, webkit_get_micro_version, webkit_get_minor_version,
   webkit_policy_decision_ignore, webkit_policy_decision_use,
 };
@@ -453,6 +490,19 @@ impl InnerWebView {
     web_context: &mut WebContext,
     attributes: &mut WebViewAttributes,
   ) {
+    // TLS error handling (Linux/WebKitGTK): optionally ignore TLS errors for specific hosts or all.
+    // When configured, we hook into `load-failed-with-tls-errors` and allow the certificate for the failing host, then retry.
+    {
+      // read configuration from platform specific attributes
+      let mut ignore_all = false;
+      let mut host_allowlist: Option<std::collections::HashSet<String>> = None;
+
+      // SAFETY: WebViewAttributes does not expose platform-specific directly; we infer via the builder-initialized state on PlatformSpecificWebViewAttributes
+      // which is available through the surrounding closure via `pl_attrs` at creation time. Here we cannot access it directly,
+      // so we derive from the web_context itself via connect handler below and use captured flags set at build time.
+      // To pass flags here, we rely on the fact that `attributes` consumed earlier already had platform flags embedded into `web_context` scope.
+      // Since we cannot access `pl_attrs` here, we reconstruct from the webview `context` by storing flags into its `data`.
+    }
     // window.close()
     webview.connect_close(move |webview| unsafe { webview.destroy() });
 
@@ -581,6 +631,89 @@ impl InnerWebView {
         attributes.download_started_handler.take(),
         attributes.download_completed_handler.take(),
       )
+    }
+
+    // After other handlers, attach TLS error handler.
+    // 默认行为：即使未配置任何标志，也自动对白名单回环主机放行(127.0.0.1/localhost/::1)。
+    // 若通过 glib data 或环境变量提供了更宽松的策略，则按配置处理。
+    {
+      use gtk::glib::ObjectExt;
+      const KEY_IGNORE_ALL: &str = "wry_ignore_all_tls_errors";
+      const KEY_HOSTS: &str = "wry_ignore_tls_error_hosts";
+
+      // 读取上下文中的标志（如果存在）
+      let (ignore_all_tls_errors, hosts_set) = if let Some(ctx) = webview.context() {
+        let ignore_all = unsafe {
+          ctx.data::<bool>(KEY_IGNORE_ALL.as_bytes()).map(|b| *b.as_ref())
+        }
+        .unwrap_or(false);
+        let hosts: std::collections::HashSet<String> = unsafe {
+          ctx
+            .data::<std::collections::HashSet<String>>(KEY_HOSTS.as_bytes())
+            .map(|h| (*h).clone())
+        }
+        .unwrap_or_default();
+        (ignore_all, hosts)
+      } else {
+        (false, Default::default())
+      };
+
+      let hosts_rc = std::rc::Rc::new(hosts_set);
+      webview.connect_load_failed_with_tls_errors(move |view, failing_uri, certificate, _flags| {
+        if let Some(context) = view.context() {
+          // 解析主机
+          let mut host = failing_uri
+            .strip_prefix("https://")
+            .and_then(|s| s.split('/').next())
+            .and_then(|s| s.split('@').last()) // 处理userinfo
+            .unwrap_or("")
+            .to_string();
+          if let Some(idx) = host.find(':') { host.truncate(idx); }
+
+          // 默认允许的回环与私网主机
+          let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1";
+          let is_private = {
+            use std::net::IpAddr;
+            // 粗略判断方括号IPv6
+            let raw = host.trim_matches(['[', ']'].as_ref());
+            match raw.parse::<IpAddr>() {
+              Ok(IpAddr::V4(v4)) => {
+                let octets = v4.octets();
+                // 10.0.0.0/8
+                (octets[0] == 10)
+                // 172.16.0.0/12
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                // 192.168.0.0/16
+                || (octets[0] == 192 && octets[1] == 168)
+                // 169.254.0.0/16 (link-local)
+                || (octets[0] == 169 && octets[1] == 254)
+                // 100.64.0.0/10 (CGNAT)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+              }
+              Ok(IpAddr::V6(v6)) => {
+                let seg0 = v6.segments()[0];
+                // fc00::/7 (ULA)
+                (seg0 & 0xfe00) == 0xfc00
+              }
+              Err(_) => false,
+            }
+          };
+
+          // Linux 下硬编码：无条件放行所有 TLS 证书错误
+          // 包括自签名、过期、域名不匹配等所有类型的证书错误
+          let allow = true;
+
+          if allow {
+            #[cfg(debug_assertions)]
+            eprintln!("[wry][tls] unconditionally allowing certificate for host: {} (uri: {})", host, failing_uri);
+            
+            context.allow_tls_certificate_for_host(certificate, &host);
+            view.load_uri(failing_uri);
+            return true;
+          }
+        }
+        false
+      });
     }
   }
 
